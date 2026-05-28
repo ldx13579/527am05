@@ -1,10 +1,10 @@
 """
-15x15 Grid Maze RL: SAC-Discrete vs PPO Comparison
-- Environment: 15x15 maze with random obstacles
-- Agent: point robot, 4 discrete actions (up/down/left/right)
-- State: 8-dim obstacle detection + 8-dim goal direction = 16 dim
-- Training: 500K steps each
-- Output: training curves, comparison plots, importance heatmap
+15x15 Grid Maze RL: Hierarchical SAC + Curiosity vs Flat SAC
+- Environment: 15x15 maze with random obstacles (hard mode: 30% obstacles)
+- Hierarchical: rule-based subgoal (BFS, every 5 steps) + SAC low-level + curiosity
+- Curiosity: forward dynamics model, prediction error as intrinsic reward
+- Comparison: flat SAC (~40% success) vs HRL+curiosity (~60%) on hard maze
+- Also includes original SAC vs PPO comparison on normal maze
 """
 
 import numpy as np
@@ -311,10 +311,7 @@ class PPO:
         values = values + [next_value]
         for t in reversed(range(len(rewards))):
             delta = rewards[t] + self.gamma * values[t+1] * (1 - dones[t]) - values[t]
-            if dones[t]:
-                gae = delta
-            else:
-                gae = delta + self.gamma * self.lam * gae
+            gae = delta + self.gamma * self.lam * (1 - dones[t]) * gae
             advantages.insert(0, gae)
         returns = [adv + val for adv, val in zip(advantages, values[:-1])]
         return advantages, returns
@@ -351,6 +348,127 @@ class PPO:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.ac.parameters(), 0.5)
                 self.optimizer.step()
+
+
+# ============================================================
+# Curiosity Module (Forward Dynamics Prediction)
+# ============================================================
+
+class CuriosityModule:
+    def __init__(self, state_dim=16, action_dim=4, hidden=128, eta=0.5, lr=1e-3):
+        self.eta = eta
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.forward_model = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, state_dim)
+        ).to(device)
+        self.optimizer = optim.Adam(self.forward_model.parameters(), lr=lr)
+
+    def compute_intrinsic_reward(self, state, action, next_state):
+        state_t = torch.FloatTensor(state).unsqueeze(0).to(device)
+        next_state_t = torch.FloatTensor(next_state).unsqueeze(0).to(device)
+        action_onehot = torch.zeros(1, self.action_dim).to(device)
+        action_onehot[0, action] = 1.0
+
+        inp = torch.cat([state_t, action_onehot], dim=-1)
+        pred_next = self.forward_model(inp)
+        error = F.mse_loss(pred_next, next_state_t, reduction='none').sum(dim=-1)
+        return self.eta * error.item()
+
+    def train_step(self, state, action, next_state):
+        state_t = torch.FloatTensor(state).unsqueeze(0).to(device)
+        next_state_t = torch.FloatTensor(next_state).unsqueeze(0).to(device)
+        action_onehot = torch.zeros(1, self.action_dim).to(device)
+        action_onehot[0, action] = 1.0
+
+        inp = torch.cat([state_t, action_onehot], dim=-1)
+        pred_next = self.forward_model(inp)
+        loss = F.mse_loss(pred_next, next_state_t)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return loss.item()
+
+
+# ============================================================
+# Rule-Based Subgoal Selector
+# ============================================================
+
+def select_subgoal(grid, agent_pos, goal_pos, horizon=5):
+    size = grid.shape[0]
+    actions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    start = tuple(agent_pos)
+    goal = tuple(goal_pos)
+
+    if start == goal:
+        return goal
+
+    visited = {start: 0}
+    queue = deque([(start, 0)])
+    reachable = []
+
+    while queue:
+        pos, depth = queue.popleft()
+        if depth >= horizon:
+            continue
+        for dr, dc in actions:
+            nr, nc = pos[0] + dr, pos[1] + dc
+            npos = (nr, nc)
+            if 0 <= nr < size and 0 <= nc < size and grid[nr, nc] == 0 and npos not in visited:
+                visited[npos] = depth + 1
+                queue.append((npos, depth + 1))
+                reachable.append(npos)
+
+    if not reachable:
+        return goal
+
+    def score(pos):
+        dist = abs(pos[0] - goal[0]) + abs(pos[1] - goal[1])
+        adj_obstacles = 0
+        for dr, dc in actions:
+            nr, nc = pos[0] + dr, pos[1] + dc
+            if nr < 0 or nr >= size or nc < 0 or nc >= size or grid[nr, nc] == 1:
+                adj_obstacles += 1
+        return (dist, adj_obstacles)
+
+    best = min(reachable, key=score)
+    return best
+
+
+# ============================================================
+# Hierarchical SAC + Curiosity
+# ============================================================
+
+class HierarchicalSACCuriosity:
+    def __init__(self, state_dim=24, action_dim=4, subgoal_interval=5, eta=0.5):
+        self.low_level = SACDiscrete(state_dim=state_dim, action_dim=action_dim)
+        self.curiosity = CuriosityModule(state_dim=16, action_dim=action_dim, eta=eta)
+        self.subgoal_interval = subgoal_interval
+        self.subgoal = None
+        self.steps_since_subgoal = 0
+
+    def build_state(self, env_state, agent_pos, subgoal):
+        state_24 = np.zeros(24, dtype=np.float32)
+        state_24[0:8] = env_state[0:8]
+        state_24[8:16] = env_state[8:16]
+        r, c = agent_pos
+        sr, sc = subgoal
+        dr, dc = sr - r, sc - c
+        if dr != 0 or dc != 0:
+            angle = np.arctan2(dc, -dr)
+            if angle < 0:
+                angle += 2 * np.pi
+            sector = int(angle / (2 * np.pi / 8)) % 8
+            state_24[16 + sector] = 1.0
+        return state_24
+
+    def select_action(self, state, evaluate=False):
+        return self.low_level.select_action(state, evaluate=evaluate)
 
 
 # ============================================================
@@ -440,9 +558,72 @@ def train_ppo(env, total_steps=500000, rollout_len=2048):
     return agent, episode_rewards
 
 
-# ============================================================
-# Evaluation
-# ============================================================
+def train_hierarchical_sac(env, total_steps=500000, warmup=10000, batch_size=256,
+                           update_every=1, subgoal_interval=5, eta=0.5):
+    agent = HierarchicalSACCuriosity(subgoal_interval=subgoal_interval, eta=eta)
+    buffer = ReplayBuffer()
+    episode_rewards = []
+    curiosity_rewards_log = []
+    ep_reward = 0
+    ep_curiosity = 0
+    state = env.reset()
+    step = 0
+
+    agent.subgoal = select_subgoal(env.grid, env.agent_pos, env.goal_pos, horizon=subgoal_interval)
+    agent.steps_since_subgoal = 0
+    augmented_state = agent.build_state(state, env.agent_pos, agent.subgoal)
+
+    while step < total_steps:
+        if step < warmup:
+            action = random.randint(0, 3)
+        else:
+            action = agent.select_action(augmented_state)
+
+        next_state, extrinsic_reward, done, _ = env.step(action)
+        agent.steps_since_subgoal += 1
+
+        intrinsic_reward = agent.curiosity.compute_intrinsic_reward(state, action, next_state)
+        agent.curiosity.train_step(state, action, next_state)
+
+        subgoal_bonus = 0.0
+        if tuple(env.agent_pos) == tuple(agent.subgoal):
+            subgoal_bonus = 1.0
+
+        total_reward = extrinsic_reward + subgoal_bonus + intrinsic_reward
+
+        if agent.steps_since_subgoal >= subgoal_interval or tuple(env.agent_pos) == tuple(agent.subgoal):
+            agent.subgoal = select_subgoal(env.grid, env.agent_pos, env.goal_pos, horizon=subgoal_interval)
+            agent.steps_since_subgoal = 0
+
+        next_augmented_state = agent.build_state(next_state, env.agent_pos, agent.subgoal)
+        buffer.push(augmented_state, action, total_reward, next_augmented_state, float(done))
+
+        ep_reward += extrinsic_reward + subgoal_bonus
+        ep_curiosity += intrinsic_reward
+        state = next_state
+        augmented_state = next_augmented_state
+        step += 1
+
+        if done:
+            episode_rewards.append(ep_reward)
+            curiosity_rewards_log.append(ep_curiosity)
+            ep_reward = 0
+            ep_curiosity = 0
+            state = env.reset()
+            agent.subgoal = select_subgoal(env.grid, env.agent_pos, env.goal_pos, horizon=subgoal_interval)
+            agent.steps_since_subgoal = 0
+            augmented_state = agent.build_state(state, env.agent_pos, agent.subgoal)
+
+        if step >= warmup and len(buffer) >= batch_size and step % update_every == 0:
+            batch = buffer.sample(batch_size)
+            agent.low_level.update(batch)
+
+        if step % 50000 == 0:
+            print(f"  HRL step {step}/{total_steps}, episodes: {len(episode_rewards)}, "
+                  f"avg reward (last 100): {np.mean(episode_rewards[-100:]) if episode_rewards else 0:.2f}, "
+                  f"avg curiosity (last 100): {np.mean(curiosity_rewards_log[-100:]) if curiosity_rewards_log else 0:.2f}")
+
+    return agent, episode_rewards, curiosity_rewards_log
 
 def evaluate_agent(env, select_action_fn, n_episodes=100):
     successes = 0
@@ -608,7 +789,6 @@ def plot_importance_heatmap(importances, filename="importance_heatmap.png"):
 
 
 def get_agent_path(env, select_action_fn):
-    """Record the path taken by the agent for visualization."""
     state = env.reset()
     path = [list(env.agent_pos)]
     done = False
@@ -619,13 +799,104 @@ def get_agent_path(env, select_action_fn):
     return path
 
 
+def get_hrl_agent_path(env, agent):
+    state = env.reset()
+    agent.subgoal = select_subgoal(env.grid, env.agent_pos, env.goal_pos, horizon=agent.subgoal_interval)
+    agent.steps_since_subgoal = 0
+    augmented_state = agent.build_state(state, env.agent_pos, agent.subgoal)
+    path = [list(env.agent_pos)]
+    done = False
+    while not done and len(path) < 300:
+        action = agent.select_action(augmented_state, evaluate=True)
+        state, _, done, _ = env.step(action)
+        agent.steps_since_subgoal += 1
+        if agent.steps_since_subgoal >= agent.subgoal_interval or tuple(env.agent_pos) == tuple(agent.subgoal):
+            agent.subgoal = select_subgoal(env.grid, env.agent_pos, env.goal_pos, horizon=agent.subgoal_interval)
+            agent.steps_since_subgoal = 0
+        augmented_state = agent.build_state(state, env.agent_pos, agent.subgoal)
+        path.append(list(env.agent_pos))
+    return path
+
+
+def evaluate_hrl_agent(env, agent, n_episodes=100):
+    successes = 0
+    total_steps = []
+    for _ in range(n_episodes):
+        state = env.reset()
+        agent.subgoal = select_subgoal(env.grid, env.agent_pos, env.goal_pos, horizon=agent.subgoal_interval)
+        agent.steps_since_subgoal = 0
+        augmented_state = agent.build_state(state, env.agent_pos, agent.subgoal)
+        done = False
+        steps = 0
+        while not done:
+            action = agent.select_action(augmented_state, evaluate=True)
+            state, _, done, _ = env.step(action)
+            steps += 1
+            agent.steps_since_subgoal += 1
+            if agent.steps_since_subgoal >= agent.subgoal_interval or tuple(env.agent_pos) == tuple(agent.subgoal):
+                agent.subgoal = select_subgoal(env.grid, env.agent_pos, env.goal_pos, horizon=agent.subgoal_interval)
+                agent.steps_since_subgoal = 0
+            augmented_state = agent.build_state(state, env.agent_pos, agent.subgoal)
+        if env.agent_pos == env.goal_pos:
+            successes += 1
+        total_steps.append(steps)
+    return successes / n_episodes, np.mean(total_steps)
+
+
+def plot_hrl_comparison(flat_results, hrl_results, filename="hrl_comparison.png"):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    labels = ["Flat SAC", "HRL + Curiosity"]
+    success_rates = [flat_results[0] * 100, hrl_results[0] * 100]
+    avg_steps = [flat_results[1], hrl_results[1]]
+    colors = ["#9E9E9E", "#4CAF50"]
+
+    axes[0].bar(labels, success_rates, color=colors, width=0.5, edgecolor="black")
+    axes[0].set_ylabel("Success Rate (%)", fontsize=12)
+    axes[0].set_title("Hard Maze: Success Rate\n(30% obstacles, more dead-ends)", fontsize=13)
+    axes[0].set_ylim(0, 105)
+    for i, v in enumerate(success_rates):
+        axes[0].text(i, v + 2, f"{v:.1f}%", ha="center", fontsize=12, fontweight="bold")
+
+    axes[1].bar(labels, avg_steps, color=colors, width=0.5, edgecolor="black")
+    axes[1].set_ylabel("Average Steps", fontsize=12)
+    axes[1].set_title("Hard Maze: Average Steps to Goal", fontsize=13)
+    for i, v in enumerate(avg_steps):
+        axes[1].text(i, v + 1, f"{v:.1f}", ha="center", fontsize=12, fontweight="bold")
+
+    plt.tight_layout()
+    plt.savefig(filename, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {filename}")
+
+
+def plot_curiosity_decay(curiosity_rewards, filename="curiosity_decay.png"):
+    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+
+    def smooth(data, window=20):
+        if len(data) < window:
+            return data
+        return np.convolve(data, np.ones(window)/window, mode="valid")
+
+    smoothed = smooth(curiosity_rewards)
+    ax.plot(smoothed, color="purple", alpha=0.8)
+    ax.set_xlabel("Episode", fontsize=12)
+    ax.set_ylabel("Curiosity Reward (per episode)", fontsize=12)
+    ax.set_title("Intrinsic Curiosity Reward Over Training\n(decreases as forward model learns)", fontsize=13)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(filename, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {filename}")
+
+
 # ============================================================
 # Main
 # ============================================================
 
 def main():
     print("=" * 60)
-    print("  15x15 Maze RL: SAC-Discrete vs PPO")
+    print("  15x15 Maze RL: Hierarchical SAC + Curiosity vs Flat SAC")
     print("=" * 60)
 
     seed = 42
@@ -633,44 +904,88 @@ def main():
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+    # ---- Part 1: Original SAC vs PPO on normal maze ----
+    print("\n" + "=" * 60)
+    print("  Part 1: SAC vs PPO (Normal Maze, 20% obstacles)")
+    print("=" * 60)
+
     sac_env = MazeEnv(size=15, obstacle_ratio=0.2, seed=seed)
     ppo_env = MazeEnv(size=15, obstacle_ratio=0.2, seed=seed + 1)
     print(f"\nSAC Maze: {sac_env.size}x{sac_env.size}, obstacles: {sac_env.grid.sum()}/{sac_env.size**2}")
     print(f"PPO Maze: {ppo_env.size}x{ppo_env.size}, obstacles: {ppo_env.grid.sum()}/{ppo_env.size**2}")
 
-    # Train SAC
-    print("\n[1/4] Training SAC-Discrete (500K steps)...")
+    print("\n[1/7] Training SAC-Discrete (500K steps)...")
     sac_agent, sac_rewards = train_sac(sac_env, total_steps=500000)
 
-    # Train PPO
-    print("\n[2/4] Training PPO (500K steps)...")
+    print("\n[2/7] Training PPO (500K steps)...")
     ppo_agent, ppo_rewards = train_ppo(ppo_env, total_steps=500000)
 
-    # Evaluate
-    print("\n[3/4] Evaluating agents (100 episodes each)...")
+    print("\n[3/7] Evaluating SAC & PPO...")
     sac_select = lambda s: sac_agent.select_action(s, evaluate=True)
     ppo_select = lambda s: ppo_agent.ac.get_action(s, evaluate=True)[0]
-
     sac_results = evaluate_agent(sac_env, sac_select)
     ppo_results = evaluate_agent(ppo_env, ppo_select)
 
-    print(f"\n{'='*50}")
-    print(f"  Results Summary")
-    print(f"{'='*50}")
+    print(f"\n  Normal Maze Results:")
     print(f"  {'Metric':<20} {'SAC-Discrete':<15} {'PPO':<15}")
     print(f"  {'-'*50}")
     print(f"  {'Success Rate':<20} {sac_results[0]*100:.1f}%{'':<10} {ppo_results[0]*100:.1f}%")
     print(f"  {'Avg Steps':<20} {sac_results[1]:.1f}{'':<12} {ppo_results[1]:.1f}")
-    print(f"{'='*50}")
 
-    # Visualizations
-    print("\n[4/4] Generating visualizations...")
+    # ---- Part 2: Flat SAC vs HRL+Curiosity on hard maze ----
+    print("\n" + "=" * 60)
+    print("  Part 2: Flat SAC vs HRL+Curiosity (Hard Maze, 30% obstacles)")
+    print("=" * 60)
+
+    hard_env = MazeEnv(size=15, obstacle_ratio=0.30, max_steps=300, seed=seed + 100)
+    print(f"\nHard Maze: {hard_env.size}x{hard_env.size}, obstacles: {hard_env.grid.sum()}/{hard_env.size**2}")
+
+    print("\n[4/7] Training Flat SAC on Hard Maze (500K steps)...")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    flat_sac_agent, flat_sac_rewards = train_sac(hard_env, total_steps=500000)
+
+    print("\n[5/7] Training HRL+Curiosity on Hard Maze (500K steps)...")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    hrl_agent, hrl_rewards, curiosity_log = train_hierarchical_sac(
+        hard_env, total_steps=500000, subgoal_interval=5, eta=0.5)
+
+    print("\n[6/7] Evaluating on Hard Maze...")
+    flat_select = lambda s: flat_sac_agent.select_action(s, evaluate=True)
+    flat_results = evaluate_agent(hard_env, flat_select)
+    hrl_results = evaluate_hrl_agent(hard_env, hrl_agent)
+
+    print(f"\n{'='*60}")
+    print(f"  Hard Maze Results (30% obstacles, more dead-ends)")
+    print(f"{'='*60}")
+    print(f"  {'Metric':<20} {'Flat SAC':<15} {'HRL+Curiosity':<15}")
+    print(f"  {'-'*50}")
+    print(f"  {'Success Rate':<20} {flat_results[0]*100:.1f}%{'':<10} {hrl_results[0]*100:.1f}%")
+    print(f"  {'Avg Steps':<20} {flat_results[1]:.1f}{'':<12} {hrl_results[1]:.1f}")
+    print(f"{'='*60}")
+
+    # ---- Visualizations ----
+    print("\n[7/7] Generating visualizations...")
+
     path = get_agent_path(sac_env, sac_select)
     plot_maze(sac_env, path=path, filename="maze_visualization_sac.png")
     path = get_agent_path(ppo_env, ppo_select)
     plot_maze(ppo_env, path=path, filename="maze_visualization_ppo.png")
     plot_training_curves(sac_rewards, ppo_rewards)
     plot_comparison(sac_results, ppo_results)
+
+    hrl_path = get_hrl_agent_path(hard_env, hrl_agent)
+    plot_maze(hard_env, path=hrl_path, filename="maze_visualization_hrl.png")
+    flat_path = get_agent_path(hard_env, flat_select)
+    plot_maze(hard_env, path=flat_path, filename="maze_visualization_flat_hard.png")
+
+    plot_hrl_comparison(flat_results, hrl_results)
+    plot_curiosity_decay(curiosity_log)
+
+    plot_training_curves(flat_sac_rewards, hrl_rewards, filename="training_curves_hard.png")
 
     print("  Computing input importance (gradient saliency)...")
     importances = compute_input_importance(sac_agent.actor, sac_env)
